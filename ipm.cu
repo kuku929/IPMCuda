@@ -2,6 +2,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <Eigen/Dense>
 #include "cuda_runtime.h"
 #include "rclcpp/rclcpp.hpp"
 #include <pcl/point_types.h>
@@ -17,37 +18,34 @@
 #include <math.h>
 
 #include "cv_bridge/cv_bridge.h"
-#define BLOCK_SIZE 16
+#define BLOCKS 64
 #define imin(a,b) (a<b?a:b)
 
 using namespace std::chrono_literals;
 using namespace std;
+using namespace Eigen;
 using std::placeholders::_1;
-const int N = 33 * 1024;
-const int threadsPerBlock = 256;
-const int blocksPerGrid = imin(32, (N+threadsPerBlock-1) / threadsPerBlock);
 template<typename T>
 __global__ void dev_matmul(const T *a, const T *b, T *output, int rows){
-	//a is 3x3 set of matrices
+	//a is 3x3 matrix
 	//b is 3x1 set of matrices
 	//output is 3x1 set of matrices
 	int thread_id= threadIdx.x;
 	int block_id = blockIdx.x;
+	int offset = block_id*(rows+BLOCKS-1)/BLOCKS + thread_id;
 
-	int offset = block_id*threadsPerBlock + thread_id;
 	if(offset < rows){
 		for(int i=0; i < 3; ++i){
 			double temp=0;
 			for(int k=0; k < 3; ++k){
-				temp += a[offset*9 + i*3 + k]*b[offset*3 + k];
+				temp += a[i*3+k]*b[offset*3 + k];
 			}
 			output[offset*3 + i] = temp;
 		}
 	}
 }
 
-
-void matmul(double *a, doubel *b, double *c){
+void matmul(double *a, double *b, double *c){
 	//a is 3x3
 	//b is 3x1
 	for(int i=0; i < 3; ++i){
@@ -56,39 +54,32 @@ void matmul(double *a, doubel *b, double *c){
 			temp += a[i*3 + k]*b[k]; 
 		}
 		c[i] = temp;
-		}
 	}
 }
 
-__global__ void dot(double* a, double* b, double* c) {
-	__shared__ float cache[threadsPerBlock];
-	int tid = threadIdx.x + blockIdx.x * blockDim.x;
-	int cacheIndex = threadIdx.x;
-	
-	float temp = 0;
-	while (tid < N){
-		temp += a[tid] * b[tid];
-		tid += blockDim.x * gridDim.x;
+__global__ void dot(double* a, double* b, double* c, int rows) {
+	int thread_id = threadIdx.x;
+	int block_id = blockIdx.x;
+
+	int offset = block_id*(rows+BLOCKS-1)/BLOCKS + thread_id;
+	if(offset < rows){
+		double temp=0;
+		for(int i=0; i < 3; ++i){
+		    temp += a[i]*b[offset*3+i];    
+		}
+		c[offset] = temp;
 	}
-	
-	// set the cache values
-	cache[cacheIndex] = temp;
-	
-	// synchronize threads in this block
-	__syncthreads();
-	
-	// for reductions, threadsPerBlock must be a power of 2
-	// because of the following code
-	int i = blockDim.x/2;
-	while (i != 0){
-		if (cacheIndex < i)
-			cache[cacheIndex] += cache[cacheIndex + i];
-		__syncthreads();
-		i /= 2;
-	}
-	
-	if (cacheIndex == 0)
-		c[blockIdx.x] = cache[0];
+	//if(offset == 0){
+		//for(int i=0;i < 3; ++i){
+			//printf("gpu : %f ", c[0]);
+		//}
+		//printf("\n");
+	//}
+}
+
+
+void log(cudaError_t &&error, int line=0){
+	//std::cout << cudaGetErrorString(error) << "line : " << line << '\n' << std::flush;
 }
 
 class IPM : public rclcpp::Node
@@ -105,34 +96,32 @@ class IPM : public rclcpp::Node
   private:
     void call(const sensor_msgs::msg::CameraInfo::SharedPtr msg)
     {
-        this->camera_info = msg;
+        this->camera_info = *msg;
     }
     void process_img(const sensor_msgs::msg::Image::SharedPtr msg)
     {
 	//processing recieved image
-        sensor_msgs::msg::PointCloud2 pub_pointcloud;
-        PointCloud::Ptr cloud_msg (new PointCloud);
-        cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::RGB8);
+	sensor_msgs::msg::PointCloud2 pub_pointcloud;
+	unique_ptr<PointCloud> cloud_msg  = std::make_unique<PointCloud>();
+	cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::RGB8);
 
-        cv::Mat gray_image;
-        cv::cvtColor(cv_ptr->image, gray_image, cv::COLOR_RGB2GRAY);
+	cv::Mat gray_image;
+	cv::cvtColor(cv_ptr->image, gray_image, cv::COLOR_RGB2GRAY);
 
-        cv::inRange(gray_image, cv::Scalar(125), cv::Scalar(140), gray_image); 
-        cv::Mat nonZeroCoordinates;
-        cv::findNonZero(gray_image, nonZeroCoordinates);
+	cv::inRange(gray_image, cv::Scalar(245), cv::Scalar(255), gray_image); 
+	cv::Mat nonZeroCoordinates;
+	cv::findNonZero(gray_image, nonZeroCoordinates);
 
 
 	//some calculations
 	float roll = 0;
-	float pitch = -17 * M_PI / 180;
+	float pitch = 0;//-17 * M_PI / 180;
 	float yaw = 0;
-	float h = 1.18;
+	float h = 0.8;
 	int m = 3;
 	int n = 3;
-	double *k, *nor, *uv;
-	cudaMallocHost((void **) &nor, sizeof(double)*3);
-	cudaMallocHost((void **) &uv, sizeof(double)*3);
-	cudaMallocHost((void **) &k, sizeof(double)*n*m);
+	vector<double> k(9), nor(3), uv(3);
+
 	double cy, cr, sy, sr, sp, cp;
 	cy = cos(yaw);
 	sy = sin(yaw);
@@ -155,86 +144,83 @@ class IPM : public rclcpp::Node
 	nor[2] = 0;
 
 	//what does this do?
-	matmul(k, nor, uv);
+	matmul(k.data(), nor.data(), uv.data());
 
-	//no of points to map
+	// no of points to map
 	cv::Size s = nonZeroCoordinates.size();
 	int rows = s.height;
+	std::cout << "rows : " << rows << '\n';
+	auto caminfo = this->camera_info.k;
+	Eigen::Map<Matrix<double,3,3,RowMajor> > mat(caminfo.data());
+	mat = mat.inverse();
+	//std::cout << mat;
+	double *inv_caminfo = mat.data();
 
-	double *uv_hom, *kin_uv, *denom;
-	auto caminfo = this->camera_info->k;
-	cudaMallocHost((void **) &uv_hom, sizeof(double)*m*1*rows);
-	cudaMallocHost((void **) &kin_uv, sizeof(double)*m*1*rows);
-	cudaMallocHost((void **) &denom, sizeof(double)*rows);
+	//for(int i=0;i < 9; ++i){
+		//std::cout << inv_caminfo[i] << ' ';
+	//}
+	//std::cout << '\n';
+	//std::cout << mat;
+	vector<double> kin_uv(3*rows), uv_hom(3*rows), denom(rows);
+
 
 	//device
 	double *d_uv_hom, *d_kin_uv, *d_caminfo, *d_denom, *d_uv;
-	cudaMalloc((void **) &d_uv_hom, sizeof(double)*m*1*rows);
-	cudaMalloc((void **) &d_kin_uv, sizeof(double)*m*1*rows);
-	cudaMalloc((void **) &d_caminfo, sizeof(double)*m*n*rows);
-	cudaMalloc((void **) &d_denom, sizeof(double)*rows);
-	cudaMalloc((void **) &d_uv, sizeof(double)*m*1*rows);
+	log(cudaMalloc((void **) &d_uv_hom, sizeof(double)*3*rows));
+	log(cudaMalloc((void **) &d_kin_uv, sizeof(double)*3*rows));
+	log(cudaMalloc((void **) &d_caminfo, sizeof(double)*9));
+	log(cudaMalloc((void **) &d_denom, sizeof(double)*rows));
+	log(cudaMalloc((void **) &d_uv, sizeof(double)*3));
  
-	//gathering data for all points
-	 for (int i = 0; i < rows; i++)
-	 {
-	     int x = nonZeroCoordinates.at<cv::Point>(i).x;
-	     int y = nonZeroCoordinates.at<cv::Point>(i).y;
-	     uv_hom[i] = x;
-	     uv_hom[i+1] = y; 
-	     uv_hom[i+2] = 1;
-	 }
 	 
 	//copying to device
-	cudaMemcpy(d_caminfo, caminfo, sizeof(double)*m*n*rows, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_uv_hom, uv_hom, sizeof(double)*m*1*rows, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_uv, uv, sizeof(double)*m*1*rows, cudaMemcpyHostToDevice);
+	log(cudaMemcpy(d_caminfo, inv_caminfo, sizeof(double)*9, cudaMemcpyHostToDevice));
+	cudaMemcpy(d_uv_hom, uv_hom.data(), sizeof(double)*3*rows, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_uv, uv.data(), sizeof(double)*3, cudaMemcpyHostToDevice);
 
 	//batch multiplication
 	//launching rows no of threads and one block
-	dev_matmul<<<2, (rows+1)/2>>(d_caminfo, d_uv_hom, d_kin_uv, rows);
-	dot<<<2, (rows+1)/2>>>(d_uv, d_kin_uv, d_denom);
+	//std::cout << "cpu : " << caminfo[8] << '\n';
+	dev_matmul<<<BLOCKS, (rows+BLOCKS-1)/BLOCKS>>>(d_caminfo, d_uv_hom, d_kin_uv, rows);
+	dot<<<BLOCKS, (rows+BLOCKS-1)/BLOCKS>>>(d_uv, d_kin_uv, d_denom, rows);
 	
-	cudaMemcpy(kin_uv, d_kin_uv, sizeof(double)*m*rows, cudaMemcpyDeviceToHost);
-	cudaMemcpy(denom, d_denom, sizeof(double)*rows, cudaMemcpyDeviceToHost);
+	cudaMemcpy(kin_uv.data(), d_kin_uv, sizeof(double)*3*rows, cudaMemcpyDeviceToHost);
+	cudaMemcpy(denom.data(), d_denom, sizeof(double)*rows, cudaMemcpyDeviceToHost);
+	
 
-	double h = 1.18;
 	for(int i=0; i < rows; ++i){
 		pcl::PointXYZ vec;
-		vec.x = h * kin_uv[0] / denom;
-		vec.y =  h * kin_uv[1] / denom;
-		vec.z =  h * kin_uv[2] / denom;
+		//fix, make it work im not doing it
+		vec.x = h * kin_uv[i*3+2] / denom[i];
+		vec.y =  -h * kin_uv[i*3] / denom[i];
+		vec.z =  0;//h * kin_uv[i*3+1] / denom[i];
+		//std::cout << "value : " << denom[i] << ' ';
 		cloud_msg->points.push_back(vec);
 	}
+	//std::cout << std::endl;
 
 	 cudaFree(d_uv_hom);
 	 cudaFree(d_uv_hom);
 	 cudaFree(d_kin_uv);
 	 cudaFree(d_caminfo);
-	 cudaFree(d_denom);
-	 cudaFreeHost(uv_hom);
-	 cudaFreeHost(kin_uv);
-	 cudaFreeHost(caminfo);    
+	 cudaFree(d_denom);   
 	 cloud_msg->height   = 1;
 	 cloud_msg->width    = cloud_msg->points.size();
 	 cloud_msg->is_dense = false;
 	 pcl::toROSMsg(*cloud_msg, pub_pointcloud);
-	 pub_pointcloud.header.frame_id = "base_link";
+	 pub_pointcloud.header.frame_id = "camera_forward_frame";
 	 pub_pointcloud.header.stamp = rclcpp::Clock().now();
 
 	 // Publishing our cloud image
 	 publisher_->publish(pub_pointcloud);
 
 	 cloud_msg->points.clear();
-	 cudaFreeHost(k);
-	 cudaFreeHost(nor);
-	 cudaFreeHost(uv);
     }
     
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr subscription_caminfo;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr subscription_img;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
-    sensor_msgs::msg::CameraInfo::SharedPtr camera_info;
+    sensor_msgs::msg::CameraInfo camera_info;
     typedef pcl::PointCloud<pcl::PointXYZ> PointCloud;
 };
 
