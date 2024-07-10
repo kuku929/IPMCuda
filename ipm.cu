@@ -35,6 +35,7 @@ __global__ void dev_matmul(const T *a, const T *b, T *output, int rows){
 	int offset = block_id*(rows+BLOCKS-1)/BLOCKS + thread_id;
 
 	if(offset < rows){
+ 		#pragma unroll
 		for(int i=0; i < 3; ++i){
 			double temp=0;
 			for(int k=0; k < 3; ++k){
@@ -48,6 +49,7 @@ __global__ void dev_matmul(const T *a, const T *b, T *output, int rows){
 void matmul(double *a, double *b, double *c){
 	//a is 3x3
 	//b is 3x1
+	#pragma unroll
 	for(int i=0; i < 3; ++i){
 		double temp=0;
 		for(int k=0; k < 3; ++k){
@@ -64,6 +66,7 @@ __global__ void dot(double* a, double* b, double* c, int rows) {
 	int offset = block_id*(rows+BLOCKS-1)/BLOCKS + thread_id;
 	if(offset < rows){
 		double temp=0;
+ 		#pragma unroll
 		for(int i=0; i < 3; ++i){
 		    temp += a[i]*b[offset*3+i];    
 		}
