@@ -203,7 +203,7 @@ class IPM : public rclcpp::Node
 	//std::cout << std::endl;
 
 	 cudaFree(d_uv_hom);
-	 cudaFree(d_uv_hom);
+	 cudaFree(d_uv);
 	 cudaFree(d_kin_uv);
 	 cudaFree(d_caminfo);
 	 cudaFree(d_denom);   
